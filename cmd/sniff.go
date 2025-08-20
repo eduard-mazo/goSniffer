@@ -31,26 +31,22 @@ var sniffCmd = &cobra.Command{
 			log.Fatal("Debe especificar la dirección IP de la interfaz con --ip")
 		}
 
-		// 1. Encontrar la interfaz de red a partir de la dirección IP
 		iface, err := findInterfaceByIP(ipAddr)
 		if err != nil {
 			log.Fatalf("Error al buscar la interfaz: %v", err)
 		}
 		fmt.Printf("✅ Interfaz encontrada: %s para la IP %s\n", iface, ipAddr)
 
-		// 2. Parsear los puertos a monitorear
 		if portsStr == "" {
-			portsStr = "2404" // Puerto por defecto
+			portsStr = "2404"
 		}
 		ports := strings.Split(portsStr, ",")
 
-		// 3. Parsear la lista de puntos a filtrar
 		pointFilterMap, err := parsePointsString(pointsStr)
 		if err != nil {
 			log.Fatalf("Error al parsear la lista de puntos: %v", err)
 		}
 
-		// 4. Configurar el pool de workers para procesar paquetes
 		packetChan := make(chan iec104.PacketToProcess, 200)
 		var wgWorkers sync.WaitGroup
 		const numWorkers = 4
@@ -63,28 +59,28 @@ var sniffCmd = &cobra.Command{
 			}()
 		}
 
-		// 5. Iniciar un listener por cada puerto especificado
 		var wgListeners sync.WaitGroup
 		for _, port := range ports {
 			p := strings.TrimSpace(port)
 			if p == "" {
 				continue
 			}
-
 			wgListeners.Add(1)
-			go listenOnPort(iface, p, filter, pointFilterMap, rawOutput, packetChan, &wgListeners)
+			// MODIFICADO: Se pasa la ipAddr (IP local) a la función listener
+			go listenOnPort(iface, ipAddr, p, filter, pointFilterMap, rawOutput, packetChan, &wgListeners)
 		}
 
 		fmt.Printf("🚀 Escuchando en %d puerto(s): %s. Presione Ctrl+C para detener.\n\n", len(ports), portsStr)
 
-		wgListeners.Wait() // Esperar a que todos los listeners terminen
-		close(packetChan)  // Cerrar el canal una vez que no haya más productores
-		wgWorkers.Wait()   // Esperar a que los workers terminen de procesar
+		wgListeners.Wait()
+		close(packetChan)
+		wgWorkers.Wait()
 	},
 }
 
-// listenOnPort abre una sesión de pcap en una interfaz y puerto específicos
-func listenOnPort(iface, port, filter string, pointMap map[int]struct{}, raw bool, packetChan chan<- iec104.PacketToProcess, wg *sync.WaitGroup) {
+// listenOnPort abre una sesión de pcap y envía paquetes enriquecidos a los workers.
+// MODIFICADO: La firma de la función ahora incluye localIP.
+func listenOnPort(iface, localIP, port, filter string, pointMap map[int]struct{}, raw bool, packetChan chan<- iec104.PacketToProcess, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
@@ -102,27 +98,39 @@ func listenOnPort(iface, port, filter string, pointMap map[int]struct{}, raw boo
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for packet := range packetSource.Packets() {
+		// MODIFICADO: Extraer la capa de red para obtener IPs Origen y Destino
+		ipLayer := packet.Layer(layers.LayerTypeIPv4)
+		if ipLayer == nil {
+			continue
+		}
+		ip, _ := ipLayer.(*layers.IPv4)
+
 		tcpLayer := packet.Layer(layers.LayerTypeTCP)
 		if tcpLayer == nil {
 			continue
 		}
 		tcp, _ := tcpLayer.(*layers.TCP)
+
 		if len(tcp.Payload) > 0 && tcp.Payload[0] == iec104.StartByte {
 			payloadCopy := make([]byte, len(tcp.Payload))
 			copy(payloadCopy, tcp.Payload)
 
-			// Enviar paquete junto con su contexto al canal de procesamiento
+			// Se envían los datos de red junto con el payload
 			packetChan <- iec104.PacketToProcess{
-				Payload:     payloadCopy,
-				TypeFilter:  filter,
-				PointFilter: pointMap,
-				RawOutput:   raw,
+				Payload:       payloadCopy,
+				LocalIP:       localIP,
+				SourceIP:      ip.SrcIP.String(),
+				DestinationIP: ip.DstIP.String(),
+				TypeFilter:    filter,
+				PointFilter:   pointMap,
+				RawOutput:     raw,
 			}
 		}
 	}
 }
 
-// findInterfaceByIP busca el nombre de un dispositivo de red basado en su dirección IPv4.
+// Las funciones findInterfaceByIP, parsePointsString y init no necesitan cambios.
+// ... (resto del archivo sin modificaciones)
 func findInterfaceByIP(ip string) (string, error) {
 	devices, err := pcap.FindAllDevs()
 	if err != nil {
@@ -137,20 +145,15 @@ func findInterfaceByIP(ip string) (string, error) {
 	}
 	return "", errors.New("ninguna interfaz encontrada con la IP especificada")
 }
-
-// parsePointsString convierte un string como "[1,2,3]" en un mapa para búsqueda eficiente.
 func parsePointsString(pointsStr string) (map[int]struct{}, error) {
 	pointMap := make(map[int]struct{})
 	if pointsStr == "" {
 		return pointMap, nil
 	}
-
-	// Limpiar el string de entrada: quitar corchetes y espacios
 	cleanStr := strings.Trim(pointsStr, "[] \t")
 	if cleanStr == "" {
 		return pointMap, nil
 	}
-
 	parts := strings.Split(cleanStr, ",")
 	for _, part := range parts {
 		p, err := strconv.Atoi(strings.TrimSpace(part))
@@ -159,10 +162,8 @@ func parsePointsString(pointsStr string) (map[int]struct{}, error) {
 		}
 		pointMap[p] = struct{}{}
 	}
-
 	return pointMap, nil
 }
-
 func init() {
 	sniffCmd.Flags().StringVar(&ipAddr, "ip", "", "Dirección IP de la interfaz de red a escuchar (ej. --ip \"xxx.xxx.xxx.xxx\")")
 	sniffCmd.Flags().StringVar(&portsStr, "port", "2404", "Puerto o puertos TCP a escuchar, separados por comas (ej. --port \"2404,2405\")")

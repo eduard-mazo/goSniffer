@@ -11,15 +11,17 @@ import (
 
 // PacketToProcess encapsula un paquete y su contexto de filtrado para los workers.
 type PacketToProcess struct {
-	Payload     []byte
-	TypeFilter  string
-	PointFilter map[int]struct{}
-	RawOutput   bool
+	Payload       []byte
+	LocalIP       string
+	SourceIP      string
+	DestinationIP string
+	TypeFilter    string
+	PointFilter   map[int]struct{}
+	RawOutput     bool
 }
 
-// Constantes del protocolo IEC 104
 const (
-	StartByte = 0x68
+	StartByte = 0x68 // Exportado para uso en otros paquetes
 
 	// Tipos de ASDU (Type Identification)
 	TypeIDMvf = 13 // Measured value, normalized value
@@ -27,245 +29,236 @@ const (
 	TypeIDDiq = 31 // Double-point information with time tag
 )
 
-// ProcessPacketWorker es la función ejecutada por cada worker.
+// TypeInfo y typeInfoMap para la descripción detallada de las tramas.
+type TypeInfo struct {
+	Name        string
+	Description string
+}
+
+var typeInfoMap = map[byte]TypeInfo{
+	TypeIDMvf: {"M_ME_NA_1", "Measured value, normalized value"},
+	TypeIDSiq: {"M_SP_TB_1", "Single-point information with time tag"},
+	TypeIDDiq: {"M_DP_TB_1", "Double-point information with time tag"},
+	250:       {"U-FRAME TESTFR (Activation)", "Test Frame Activation"},
+	251:       {"U-FRAME TESTFR (Confirm)", "Test Frame Confirmation"},
+	252:       {"U-FRAME STARTDT (Activation)", "Start Data Transfer Activation"},
+	253:       {"U-FRAME STARTDT (Confirm)", "Start Data Transfer Confirmation"},
+	254:       {"U-FRAME STOPDT (Activation)", "Stop Data Transfer Activation"},
+	255:       {"U-FRAME STOPDT (Confirm)", "Stop Data Transfer Confirmation"},
+}
+
+// ProcessPacketWorker determina la dirección del paquete.
 func ProcessPacketWorker(ch <-chan PacketToProcess) {
 	for p := range ch {
-		output := parseAPDU(p.Payload, p.TypeFilter, p.PointFilter)
+		direction := "Rx"
+		if p.SourceIP == p.LocalIP {
+			direction = "Tx"
+		}
+
+		output := parseAPDU(p.Payload, p.TypeFilter, p.PointFilter, direction, p.SourceIP, p.DestinationIP)
+
 		if output != "" {
 			timestamp := time.Now().Format("15:04:05.000")
-			fmt.Printf("\n%s\n", timestamp)
 			if p.RawOutput {
-				fmt.Print(hexDump(p.Payload))
+				fmt.Printf("\n%s\n%s", timestamp, hexDump(p.Payload))
+			} else {
+				fmt.Printf("\n%s\n", timestamp)
 			}
 			fmt.Print(output)
 		}
 	}
 }
 
-// parseAPDU es el punto de entrada principal para decodificar una trama.
-func parseAPDU(data []byte, typeFilter string, pointFilter map[int]struct{}) string {
-	// APDU minimum length is 6 bytes (APCI only)
+// parseAPDU ahora recibe y utiliza la información de red.
+func parseAPDU(data []byte, typeFilter string, pointFilter map[int]struct{}, direction, srcIP, dstIP string) string {
 	if len(data) < 6 {
 		return ""
 	}
-
-	// APCI (Control Field)
+	flowInfo := fmt.Sprintf("[%s] %s -> %s", direction, srcIP, dstIP)
 	control1 := data[2]
-	// control2 := data[3] // Not directly used for frame type identification
 	control3 := data[4]
-	control4 := data[5] // CORRECTED: Changed from 'con5]' to 'data[5]'
+	control4 := data[5]
 
-	// Identify frame type (I, S, U) based on the first control octet
 	switch {
-	case (control1 & 0x01) == 0: // I-Frame (bit 0 is 0)
-		return parseIFrame(data, typeFilter, pointFilter)
-	case (control1 & 0x03) == 0x01: // S-Frame (bit 0 is 1, bit 1 is 0)
-		return parseSFrame(control3, control4, typeFilter)
-	case (control1 & 0x03) == 0x03: // U-Frame (bit 0 is 1, bit 1 is 1)
-		return parseUFrame(control1, typeFilter)
+	case (control1 & 0x01) == 0:
+		return parseIFrame(data, typeFilter, pointFilter, flowInfo)
+	case (control1 & 0x03) == 0x01:
+		return parseSFrame(control3, control4, typeFilter, flowInfo)
+	case (control1 & 0x03) == 0x03:
+		return parseUFrame(control1, typeFilter, flowInfo)
 	}
 	return ""
 }
 
-// parseIFrame decodifica tramas de información (que llevan datos ASDU).
-func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}) string {
-	// If typeFilter is "control", I-frames (data frames) should be skipped.
+// parseIFrame con la lógica de parseo de puntos restaurada.
+func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, flowInfo string) string {
 	if typeFilter == "control" {
 		return ""
 	}
-
-	// An I-frame with ASDU must have at least 6 bytes for APCI + 6 bytes for minimum ASDU header
-	if len(data) < 12 { // 6 (APCI) + 6 (ASDU header: TypeID, NumObjects, Cause(2), CommonAddr(2))
+	if len(data) < 12 {
 		return ""
 	}
 
-	// N(S) and N(R) sequence numbers (bits 1-15 of control fields 1,2 and 3,4 respectively)
 	sendSeqNum := int(binary.LittleEndian.Uint16(data[2:4]) >> 1)
 	recvSeqNum := int(binary.LittleEndian.Uint16(data[4:6]) >> 1)
 
-	asdu := data[6:]   // ASDU starts after the 6-byte APCI
-	if len(asdu) < 6 { // Minimum ASDU header length
+	asdu := data[6:]
+	if len(asdu) < 6 {
 		return ""
 	}
-
 	typeID := asdu[0]
-	numObjects := int(asdu[1] & 0x7F)   // Number of information objects (bits 0-6)
-	isSequence := (asdu[1] & 0x80) != 0 // SQ bit (bit 7)
 
-	// Cause of Transmission (COT) and Common Address of ASDU (CA)
-	cause := binary.LittleEndian.Uint16(asdu[2:4])
-	commonAddr := binary.LittleEndian.Uint16(asdu[4:6])
+	info, ok := typeInfoMap[typeID]
+	if !ok {
+		info = TypeInfo{"UNKNOWN", "Tipo de dato no identificado"}
+	}
+	header := fmt.Sprintf("%s | I-FRAME (%s | ID [%d] | %s) | N(S)=%d N(R)=%d\n",
+		flowInfo, info.Name, typeID, info.Description, sendSeqNum, recvSeqNum)
 
 	var asduOutput strings.Builder
-	cursor := 6 // Cursor starts after the 6-byte ASDU header
+	numObjects := int(asdu[1] & 0x7F)
+	isSequence := (asdu[1] & 0x80) != 0
+	cursor := 6
 
-	// Handle SQ=1 (Sequence of Information Objects)
 	var sequenceAddress uint32
 	if isSequence {
-		// If SQ=1, the address is common to all objects and is read once.
-		// It's a 3-byte address.
 		if len(asdu) < cursor+3 {
-			return "" // Not enough data for sequence address
+			return ""
 		}
-		// Read 3-byte address into a 4-byte buffer and then convert to uint32
 		var tempAddrBytes [4]byte
 		copy(tempAddrBytes[0:3], asdu[cursor:cursor+3])
-		sequenceAddress = binary.LittleEndian.Uint32(tempAddrBytes[:]) // Use the 4-byte buffer
+		sequenceAddress = binary.LittleEndian.Uint32(tempAddrBytes[:])
 		cursor += 3
 	}
 
+	// LÓGICA RESTAURADA: Este bucle ahora procesa los objetos de información.
 	for i := 0; i < numObjects; i++ {
 		var addr uint32
 		if !isSequence {
-			// If SQ=0, each object has its own 3-byte address.
 			if len(asdu) < cursor+3 {
-				break // Not enough data for object address, exit loop
+				break
 			}
-			// Read 3-byte address into a 4-byte buffer and then convert to uint32
 			var tempAddrBytes [4]byte
 			copy(tempAddrBytes[0:3], asdu[cursor:cursor+3])
-			addr = binary.LittleEndian.Uint32(tempAddrBytes[:]) // Use the 4-byte buffer
+			addr = binary.LittleEndian.Uint32(tempAddrBytes[:])
 			cursor += 3
 		} else {
-			addr = sequenceAddress // Use the pre-read sequence address
+			addr = sequenceAddress
 		}
 
 		var pointOutput string
 		currentObjectSize := 0
 
 		switch typeID {
-		case TypeIDMvf: // Measured value, normalized value (M_ME_NA_1)
-			currentObjectSize = 5 // Value (4 bytes float) + QDS (1 byte)
+		case TypeIDMvf:
+			currentObjectSize = 5 // value(4) + QDS(1)
 			if len(asdu) < cursor+currentObjectSize {
 				break
 			}
 			if applyFilter("analog", int(addr), typeFilter, pointFilter) {
 				value := math.Float32frombits(binary.LittleEndian.Uint32(asdu[cursor : cursor+4]))
-				qds := asdu[cursor+4] // Quality Descriptor
+				qds := asdu[cursor+4]
 				pointOutput = fmt.Sprintf("\t ANALOG    Addr: %-6d | Val: %-10.6f | QDS: 0x%02X\n", addr, value, qds)
 			}
 			cursor += currentObjectSize
-		case TypeIDSiq: // Single-point information with time tag (M_SP_TB_1)
-			currentObjectSize = 8 // SPI (1 byte) + CP56Time2a (7 bytes)
+		case TypeIDSiq:
+			currentObjectSize = 8 // SPI(1) + time(7)
 			if len(asdu) < cursor+currentObjectSize {
 				break
 			}
 			if applyFilter("digital", int(addr), typeFilter, pointFilter) {
-				spi := asdu[cursor] & 0x01 // Single-point information (SCO: bit 0)
+				spi := asdu[cursor] & 0x01
 				ts := parseCP56(asdu[cursor+1 : cursor+8])
 				pointOutput = fmt.Sprintf("\t DIGITAL   Addr: %-6d | Val: %d | Time: %s\n", addr, spi, ts.Format("15:04:05.000"))
 			}
 			cursor += currentObjectSize
-		case TypeIDDiq: // Double-point information with time tag (M_DP_TB_1)
-			currentObjectSize = 8 // DPI (1 byte) + CP56Time2a (7 bytes)
+		case TypeIDDiq:
+			currentObjectSize = 8 // DPI(1) + time(7)
 			if len(asdu) < cursor+currentObjectSize {
 				break
 			}
 			if applyFilter("double", int(addr), typeFilter, pointFilter) {
-				dpi := (asdu[cursor] >> 6) & 0x03 // Double-point information (bits 6-7)
+				dpi := (asdu[cursor] >> 6) & 0x03
 				ts := parseCP56(asdu[cursor+1 : cursor+8])
 				pointOutput = fmt.Sprintf("\t DOUBLE    Addr: %-6d | Val: %d | Time: %s\n", addr, dpi, ts.Format("15:04:05.000"))
 			}
 			cursor += currentObjectSize
 		default:
-			// If an unsupported TypeID is encountered, we can't reliably parse further objects.
-			// Break the loop and return what's parsed so far.
-			return "" // Or, depending on desired behavior, return "" if no known types are parsed.
+			i = numObjects
 		}
 		if pointOutput != "" {
 			asduOutput.WriteString(pointOutput)
 		}
 	}
 
-	// Only return output if any points were successfully parsed and added.
 	if asduOutput.Len() > 0 {
-		header := fmt.Sprintf("I-FRAME | N(S)=%d N(R)=%d | CAUSE=%d C_ADDR=%d\n", sendSeqNum, recvSeqNum, cause, commonAddr)
 		return header + asduOutput.String()
 	}
 
-	return "" // No relevant data parsed
+	return ""
 }
 
-// parseSFrame decodifica tramas de supervisión.
-func parseSFrame(control3, control4 byte, typeFilter string) string {
+// parseSFrame y parseUFrame sin cambios.
+func parseSFrame(control3, control4 byte, typeFilter, flowInfo string) string {
 	if typeFilter != "" && typeFilter != "all" && typeFilter != "control" {
 		return ""
 	}
-	// N(R) sequence number (bits 1-15 of control fields 3,4)
 	recvSeqNum := int(binary.LittleEndian.Uint16([]byte{control3, control4}) >> 1)
-	return fmt.Sprintf("S-FRAME | ACK, N(R)=%d\n", recvSeqNum)
+	return fmt.Sprintf("%s | S-FRAME (Supervisory-frame) | ACK, N(R)=%d\n", flowInfo, recvSeqNum)
 }
 
-// parseUFrame decodifica tramas de control no numeradas.
-func parseUFrame(control1 byte, typeFilter string) string {
+func parseUFrame(control1 byte, typeFilter, flowInfo string) string {
 	if typeFilter != "" && typeFilter != "all" && typeFilter != "control" {
 		return ""
 	}
-
-	var uType string
-	// Determine U-frame function based on specific bits in control1
+	var uTypeID byte
 	switch {
-	case (control1 & 0b10000000) != 0: // Bit 7 set
-		uType = "TESTFR (Confirm)"
-	case (control1 & 0b01000000) != 0: // Bit 6 set
-		uType = "TESTFR (Activation)"
-	case (control1 & 0b00100000) != 0: // Bit 5 set
-		uType = "STOPDT (Confirm)"
-	case (control1 & 0b00010000) != 0: // Bit 4 set
-		uType = "STOPDT (Activation)"
-	case (control1 & 0b00001000) != 0: // Bit 3 set
-		uType = "STARTDT (Confirm)"
-	case (control1 & 0b00000100) != 0: // Bit 2 set
-		uType = "STARTDT (Activation)"
+	case (control1 & 0b01000000) != 0:
+		uTypeID = 250
+	case (control1 & 0b10000000) != 0:
+		uTypeID = 251
+	case (control1 & 0b00000100) != 0:
+		uTypeID = 252
+	case (control1 & 0b00001000) != 0:
+		uTypeID = 253
+	case (control1 & 0b00010000) != 0:
+		uTypeID = 254
+	case (control1 & 0b00100000) != 0:
+		uTypeID = 255
 	default:
-		uType = "Unknown"
+		return fmt.Sprintf("%s | U-FRAME (Unknown)\n", flowInfo)
 	}
-	return fmt.Sprintf("U-FRAME | %s\n", uType)
+	info := typeInfoMap[uTypeID]
+	return fmt.Sprintf("%s | %s | ID [%d]\n", flowInfo, info.Name, uTypeID)
 }
 
-// applyFilter verifica si un punto de datos debe ser mostrado según los filtros.
+// applyFilter y parseCP56 sin cambios.
 func applyFilter(dataType string, addr int, typeFilter string, pointFilter map[int]struct{}) bool {
-	// 1. Filter by data type
 	passesTypeFilter := typeFilter == "" || typeFilter == "all" || typeFilter == dataType
 	if !passesTypeFilter {
 		return false
 	}
-
-	// 2. Filter by point number
 	if len(pointFilter) > 0 {
 		_, ok := pointFilter[addr]
-		return ok // Only passes if the point is in the map
+		return ok
 	}
-
-	return true // No point filter, or point filter passes
+	return true
 }
 
-// parseCP56 parses a 7-byte CP56Time2a (IEC 60870-5-104 Time) into a Go time.Time.
 func parseCP56(buf []byte) time.Time {
 	if len(buf) < 7 {
-		return time.Time{} // Return zero time if buffer is too short
+		return time.Time{}
 	}
-	// CP56Time2a fields:
-	// Octet 1-2: Milliseconds (0-59999) and Invalid (bit 15)
-	// Octet 3: Minute (0-59), Res (bits 6-7)
-	// Octet 4: Hour (0-23), Summer time (bit 7)
-	// Octet 5: Day of week (1-7), Day of month (1-31)
-	// Octet 6: Month (1-12)
-	// Octet 7: Year (0-99 relative to 2000)
-
-	ms := int(binary.LittleEndian.Uint16(buf[0:2])) // Milliseconds (0-59999)
-	min := int(buf[2] & 0x3F)                       // Minute (bits 0-5)
-	hour := int(buf[3] & 0x1F)                      // Hour (bits 0-4)
-	day := int(buf[4] & 0x1F)                       // Day of month (bits 0-4)
-	month := int(buf[5] & 0x0F)                     // Month (bits 0-3)
-	year := int(buf[6] & 0x7F)                      // Year (bits 0-6, 0-99)
-
-	// Note: IEC 104 year is relative to 2000.
-	// For simplicity, we'll assume local time zone for now.
+	ms := int(binary.LittleEndian.Uint16(buf[0:2]))
+	min := int(buf[2] & 0x3F)
+	hour := int(buf[3] & 0x1F)
+	day := int(buf[4] & 0x1F)
+	month := int(buf[5] & 0x0F)
+	year := int(buf[6] & 0x7F)
 	return time.Date(2000+year, time.Month(month), day, hour, min, ms/1000, (ms%1000)*1e6, time.Local)
 }
 
-// hexDump generates a formatted hexadecimal dump of the provided byte slice.
+// NUEVO: Función hexDump restaurada.
 func hexDump(data []byte) string {
 	var sb strings.Builder
 	sb.WriteString("--- RAW PACKET ---\n")
@@ -280,7 +273,6 @@ func hexDump(data []byte) string {
 		for j := 0; j < len(hexPart); j += 2 {
 			spacedHex += hexPart[j:j+2] + " "
 		}
-		// Pad with spaces if the line is shorter than 16 bytes for consistent formatting
 		sb.WriteString(fmt.Sprintf("  %04X: %-48s\n", i, spacedHex))
 	}
 	return sb.String()
