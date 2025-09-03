@@ -47,6 +47,21 @@ var typeInfoMap = map[byte]TypeInfo{
 	255:       {"U-FRAME STOPDT (Confirm)", "Stop Data Transfer Confirmation"},
 }
 
+// Mapa con descripciones para la Causa de la Transmisión (COT).
+var cotInfoMap = map[uint16]string{
+	1:  "periodic, cyclic",
+	2:  "background scan",
+	3:  "spontaneous",
+	4:  "initialized",
+	5:  "interrogation or interrogated",
+	6:  "activation",
+	7:  "activation confirmation",
+	8:  "deactivation",
+	9:  "deactivation confirmation",
+	10: "activation termination",
+	20: "interrogated by general interrogation",
+}
+
 // ProcessPacketWorker determina la dirección del paquete.
 func ProcessPacketWorker(ch <-chan PacketToProcess) {
 	for p := range ch {
@@ -112,8 +127,17 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 	if !ok {
 		info = TypeInfo{"UNKNOWN", "Tipo de dato no identificado"}
 	}
-	header := fmt.Sprintf("%s | I-FRAME (%s | ID [%d] | %s) | N(S)=%d N(R)=%d\n",
-		flowInfo, info.Name, typeID, info.Description, sendSeqNum, recvSeqNum)
+
+	// Extraer COT y CASDU para un encabezado más informativo
+	cot := binary.LittleEndian.Uint16(asdu[2:4])
+	casdu := binary.LittleEndian.Uint16(asdu[4:6])
+	cotDesc, ok := cotInfoMap[cot]
+	if !ok {
+		cotDesc = "Unknown"
+	}
+
+	header := fmt.Sprintf("%s | I-FRAME (%s | ID [%d]) | N(S)=%d N(R)=%d\n\tCause: %d (%s) | Common Addr: %d\n",
+		flowInfo, info.Name, typeID, sendSeqNum, recvSeqNum, cot, cotDesc, casdu)
 
 	var asduOutput strings.Builder
 	numObjects := int(asdu[1] & 0x7F)
@@ -131,7 +155,6 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 		cursor += 3
 	}
 
-	// LÓGICA RESTAURADA: Este bucle ahora procesa los objetos de información.
 	for i := 0; i < numObjects; i++ {
 		var addr uint32
 		if !isSequence {
@@ -143,7 +166,7 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 			addr = binary.LittleEndian.Uint32(tempAddrBytes[:])
 			cursor += 3
 		} else {
-			addr = sequenceAddress
+			addr = sequenceAddress + uint32(i) // En secuencia, la dirección se incrementa
 		}
 
 		var pointOutput string
@@ -178,7 +201,8 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 				break
 			}
 			if applyFilter("double", int(addr), typeFilter, pointFilter) {
-				dpi := (asdu[cursor] >> 6) & 0x03
+				// El valor DPI está en los 2 bits menos significativos (bits 0 y 1).
+				dpi := asdu[cursor] & 0x03
 				ts := parseCP56(asdu[cursor+1 : cursor+8])
 				pointOutput = fmt.Sprintf("\t DOUBLE    Addr: %-6d | Val: %d | Time: %s\n", addr, dpi, ts.Format("15:04:05.000"))
 			}
@@ -198,7 +222,7 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 	return ""
 }
 
-// parseSFrame y parseUFrame sin cambios.
+
 func parseSFrame(control3, control4 byte, typeFilter, flowInfo string) string {
 	if typeFilter != "" && typeFilter != "all" && typeFilter != "control" {
 		return ""
@@ -232,7 +256,7 @@ func parseUFrame(control1 byte, typeFilter, flowInfo string) string {
 	return fmt.Sprintf("%s | %s | ID [%d]\n", flowInfo, info.Name, uTypeID)
 }
 
-// applyFilter y parseCP56 sin cambios.
+
 func applyFilter(dataType string, addr int, typeFilter string, pointFilter map[int]struct{}) bool {
 	passesTypeFilter := typeFilter == "" || typeFilter == "all" || typeFilter == dataType
 	if !passesTypeFilter {
@@ -255,10 +279,11 @@ func parseCP56(buf []byte) time.Time {
 	day := int(buf[4] & 0x1F)
 	month := int(buf[5] & 0x0F)
 	year := int(buf[6] & 0x7F)
-	return time.Date(2000+year, time.Month(month), day, hour, min, ms/1000, (ms%1000)*1e6, time.Local)
+	now := time.Now()
+	century := (now.Year() / 100) * 100
+	return time.Date(century+year, time.Month(month), day, hour, min, ms/1000, (ms%1000)*1e6, time.Local)
 }
 
-// NUEVO: Función hexDump restaurada.
 func hexDump(data []byte) string {
 	var sb strings.Builder
 	sb.WriteString("--- RAW PACKET ---\n")

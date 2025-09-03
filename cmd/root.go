@@ -8,7 +8,7 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "iec104sniffer",
+	Use:   "104scan",
 	Short: "Sniffer IEC 60870-5-104 CLI",
 }
 

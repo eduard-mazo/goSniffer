@@ -49,7 +49,7 @@ These instructions will get you a copy of the project up and running on your loc
 
 ## 💻 Usage
 
-The `iec104sniffer` tool has two main commands: `list-interfaces` and `sniff`.
+The `104scan` tool has two main commands: `list-interfaces` and `sniff`.
 
 ### `list-interfaces`
 
