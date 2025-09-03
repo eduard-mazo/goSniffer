@@ -107,9 +107,6 @@ func parseAPDU(data []byte, typeFilter string, pointFilter map[int]struct{}, dir
 
 // parseIFrame con la lógica de parseo de puntos restaurada.
 func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, flowInfo string) string {
-	if typeFilter == "control" {
-		return ""
-	}
 	if len(data) < 12 {
 		return ""
 	}
@@ -123,12 +120,20 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 	}
 	typeID := asdu[0]
 
-	info, ok := typeInfoMap[typeID]
-	if !ok {
-		info = TypeInfo{"UNKNOWN", "Tipo de dato no identificado"}
+	// Se aplica el filtro al principio para descartar tramas de control si es necesario
+	if !applyFilter("control", 0, typeFilter, nil) && (typeID < TypeIDMvf || typeID > TypeIDDiq) {
+		if typeFilter == "control" {
+			// No hacer nada, se maneja en parseSFrame y UFrame
+		} else {
+			return ""
+		}
 	}
 
-	// Extraer COT y CASDU para un encabezado más informativo
+	info, ok := typeInfoMap[typeID]
+	if !ok {
+		info = TypeInfo{Name: "UNKNOWN", Description: "Tipo de dato no identificado"}
+	}
+
 	cot := binary.LittleEndian.Uint16(asdu[2:4])
 	casdu := binary.LittleEndian.Uint16(asdu[4:6])
 	cotDesc, ok := cotInfoMap[cot]
@@ -136,8 +141,8 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 		cotDesc = "Unknown"
 	}
 
-	header := fmt.Sprintf("%s | I-FRAME (%s | ID [%d]) | N(S)=%d N(R)=%d\n\tCause: %d (%s) | Common Addr: %d\n",
-		flowInfo, info.Name, typeID, sendSeqNum, recvSeqNum, cot, cotDesc, casdu)
+	header := fmt.Sprintf("%s | I-FRAME (%s | ID [%d] | %s) | N(S)=%d N(R)=%d\tCause: %d (%s) | Common Addr: %d\n",
+		flowInfo, info.Name, typeID, info.Description, sendSeqNum, recvSeqNum, cot, cotDesc, casdu)
 
 	var asduOutput strings.Builder
 	numObjects := int(asdu[1] & 0x7F)
@@ -166,7 +171,7 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 			addr = binary.LittleEndian.Uint32(tempAddrBytes[:])
 			cursor += 3
 		} else {
-			addr = sequenceAddress + uint32(i) // En secuencia, la dirección se incrementa
+			addr = sequenceAddress + uint32(i)
 		}
 
 		var pointOutput string
@@ -174,37 +179,36 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 
 		switch typeID {
 		case TypeIDMvf:
-			currentObjectSize = 5 // value(4) + QDS(1)
+			currentObjectSize = 5
 			if len(asdu) < cursor+currentObjectSize {
 				break
 			}
 			if applyFilter("analog", int(addr), typeFilter, pointFilter) {
 				value := math.Float32frombits(binary.LittleEndian.Uint32(asdu[cursor : cursor+4]))
 				qds := asdu[cursor+4]
-				pointOutput = fmt.Sprintf("\t ANALOG    Addr: %-6d | Val: %-10.6f | QDS: 0x%02X\n", addr, value, qds)
+				pointOutput = fmt.Sprintf("\tANALOG\tAddr: %-6d\t| Val: %-10.6f\t| QDS: 0x%02X\n", addr, value, qds)
 			}
 			cursor += currentObjectSize
 		case TypeIDSiq:
-			currentObjectSize = 8 // SPI(1) + time(7)
+			currentObjectSize = 8
 			if len(asdu) < cursor+currentObjectSize {
 				break
 			}
 			if applyFilter("digital", int(addr), typeFilter, pointFilter) {
 				spi := asdu[cursor] & 0x01
 				ts := parseCP56(asdu[cursor+1 : cursor+8])
-				pointOutput = fmt.Sprintf("\t DIGITAL   Addr: %-6d | Val: %d | Time: %s\n", addr, spi, ts.Format("15:04:05.000"))
+				pointOutput = fmt.Sprintf("\tSINGLE\tAddr: %-6d\t| Val: %d\t| Time: %s\n", addr, spi, ts.Format("15:04:05.000"))
 			}
 			cursor += currentObjectSize
 		case TypeIDDiq:
-			currentObjectSize = 8 // DPI(1) + time(7)
+			currentObjectSize = 8
 			if len(asdu) < cursor+currentObjectSize {
 				break
 			}
 			if applyFilter("double", int(addr), typeFilter, pointFilter) {
-				// El valor DPI está en los 2 bits menos significativos (bits 0 y 1).
 				dpi := asdu[cursor] & 0x03
 				ts := parseCP56(asdu[cursor+1 : cursor+8])
-				pointOutput = fmt.Sprintf("\t DOUBLE    Addr: %-6d | Val: %d | Time: %s\n", addr, dpi, ts.Format("15:04:05.000"))
+				pointOutput = fmt.Sprintf("\tDOUBLE\tAddr: %-6d\t| Val: %d\t| Time: %s\n", addr, dpi, ts.Format("15:04:05.000"))
 			}
 			cursor += currentObjectSize
 		default:
@@ -222,9 +226,8 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 	return ""
 }
 
-
 func parseSFrame(control3, control4 byte, typeFilter, flowInfo string) string {
-	if typeFilter != "" && typeFilter != "all" && typeFilter != "control" {
+	if !applyFilter("control", 0, typeFilter, nil) {
 		return ""
 	}
 	recvSeqNum := int(binary.LittleEndian.Uint16([]byte{control3, control4}) >> 1)
@@ -232,7 +235,7 @@ func parseSFrame(control3, control4 byte, typeFilter, flowInfo string) string {
 }
 
 func parseUFrame(control1 byte, typeFilter, flowInfo string) string {
-	if typeFilter != "" && typeFilter != "all" && typeFilter != "control" {
+	if !applyFilter("control", 0, typeFilter, nil) {
 		return ""
 	}
 	var uTypeID byte
@@ -256,16 +259,26 @@ func parseUFrame(control1 byte, typeFilter, flowInfo string) string {
 	return fmt.Sprintf("%s | %s | ID [%d]\n", flowInfo, info.Name, uTypeID)
 }
 
-
 func applyFilter(dataType string, addr int, typeFilter string, pointFilter map[int]struct{}) bool {
-	passesTypeFilter := typeFilter == "" || typeFilter == "all" || typeFilter == dataType
-	if !passesTypeFilter {
-		return false
+	if typeFilter != "" && typeFilter != "all" {
+		filters := strings.Split(typeFilter, ",")
+		typeMatch := false
+		for _, f := range filters {
+			if strings.TrimSpace(f) == dataType {
+				typeMatch = true
+				break
+			}
+		}
+		if !typeMatch {
+			return false
+		}
 	}
+
 	if len(pointFilter) > 0 {
 		_, ok := pointFilter[addr]
 		return ok
 	}
+
 	return true
 }
 

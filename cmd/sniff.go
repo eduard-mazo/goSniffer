@@ -66,7 +66,6 @@ var sniffCmd = &cobra.Command{
 				continue
 			}
 			wgListeners.Add(1)
-			// MODIFICADO: Se pasa la ipAddr (IP local) a la función listener
 			go listenOnPort(iface, ipAddr, p, filter, pointFilterMap, rawOutput, packetChan, &wgListeners)
 		}
 
@@ -78,8 +77,6 @@ var sniffCmd = &cobra.Command{
 	},
 }
 
-// listenOnPort abre una sesión de pcap y envía paquetes enriquecidos a los workers.
-// MODIFICADO: La firma de la función ahora incluye localIP.
 func listenOnPort(iface, localIP, port, filter string, pointMap map[int]struct{}, raw bool, packetChan chan<- iec104.PacketToProcess, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -98,7 +95,6 @@ func listenOnPort(iface, localIP, port, filter string, pointMap map[int]struct{}
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	for packet := range packetSource.Packets() {
-		// MODIFICADO: Extraer la capa de red para obtener IPs Origen y Destino
 		ipLayer := packet.Layer(layers.LayerTypeIPv4)
 		if ipLayer == nil {
 			continue
@@ -115,7 +111,6 @@ func listenOnPort(iface, localIP, port, filter string, pointMap map[int]struct{}
 			payloadCopy := make([]byte, len(tcp.Payload))
 			copy(payloadCopy, tcp.Payload)
 
-			// Se envían los datos de red junto con el payload
 			packetChan <- iec104.PacketToProcess{
 				Payload:       payloadCopy,
 				LocalIP:       localIP,
@@ -129,8 +124,6 @@ func listenOnPort(iface, localIP, port, filter string, pointMap map[int]struct{}
 	}
 }
 
-// Las funciones findInterfaceByIP, parsePointsString y init no necesitan cambios.
-// ... (resto del archivo sin modificaciones)
 func findInterfaceByIP(ip string) (string, error) {
 	devices, err := pcap.FindAllDevs()
 	if err != nil {
@@ -145,6 +138,7 @@ func findInterfaceByIP(ip string) (string, error) {
 	}
 	return "", errors.New("ninguna interfaz encontrada con la IP especificada")
 }
+
 func parsePointsString(pointsStr string) (map[int]struct{}, error) {
 	pointMap := make(map[int]struct{})
 	if pointsStr == "" {
@@ -164,11 +158,14 @@ func parsePointsString(pointsStr string) (map[int]struct{}, error) {
 	}
 	return pointMap, nil
 }
+
 func init() {
 	sniffCmd.Flags().StringVar(&ipAddr, "ip", "", "Dirección IP de la interfaz de red a escuchar (ej. --ip \"xxx.xxx.xxx.xxx\")")
 	sniffCmd.Flags().StringVar(&portsStr, "port", "2404", "Puerto o puertos TCP a escuchar, separados por comas (ej. --port \"2404,2405\")")
-	sniffCmd.Flags().StringVar(&filter, "filter", "", "Filtrar por tipo: analog | digital | double | control  (ej. --filter \"analog\")")
+	sniffCmd.Flags().StringVar(&filter, "filter", "", "Filtrar por tipo: analog, digital, double, control. Se pueden combinar con comas (ej. --filter \"analog,digital\")")
 	sniffCmd.Flags().StringVar(&pointsStr, "points", "", "Filtrar por lista de puntos (ej. --points \"[10020,10021,50010]\")")
 	sniffCmd.Flags().BoolVar(&rawOutput, "raw", false, "Mostrar la trama completa en formato hexadecimal")
-	sniffCmd.MarkFlagRequired("ip")
+	if err := sniffCmd.MarkFlagRequired("ip"); err != nil {
+		log.Fatalf("Failed to mark 'ip' flag as required: %v", err)
+	}
 }
