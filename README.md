@@ -1,6 +1,6 @@
-# ⚡ iec104sniffer: IEC 60870-5-104 Protocol Sniffer
+# ⚡ goSniffer: IEC 60870-5-104 Protocol Sniffer
 
-`iec104sniffer` is a command-line interface (CLI) tool designed to capture and decode IEC 60870-5-104 protocol frames. It provides advanced sniffing capabilities, allowing users to monitor communication on specified network interfaces and ports, with options for filtering by data type and information object address.
+`goSniffer` is a command-line interface (CLI) tool designed to capture and decode IEC 60870-5-104 protocol frames. It provides advanced sniffing capabilities, allowing users to monitor communication on specified network interfaces and ports, with options for filtering by data type and information object address.
 
 ## ✨ Features
 
@@ -24,7 +24,7 @@ These instructions will get you a copy of the project up and running on your loc
 ### Prerequisites
 
 * **Go (Golang)**: Ensure you have Go installed (version 1.16 or higher is recommended). You can download it from [golang.org](https://golang.org/dl/).
-* **Npcap (Windows)** or **libpcap-dev (Linux/macOS)**: `iec104sniffer` uses `gopacket` which relies on `pcap` for packet capture.
+* **Npcap (Windows)** or **libpcap-dev (Linux/macOS)**: `goSniffer` uses `gopacket` which relies on `pcap` for packet capture.
     * **Windows**: Download and install [Npcap](https://nmap.org/npcap/1). Make sure to check "Install Npcap in WinPcap API-compatible Mode" during installation if you encounter issues.
     * **Linux/macOS**: Install the `libpcap-dev` package (or equivalent) for your distribution.
         * Debian/Ubuntu: `sudo apt-get install libpcap-dev`
@@ -36,8 +36,8 @@ These instructions will get you a copy of the project up and running on your loc
 1.  **Clone the repository:**
 
     ```bash
-    git clone [https://github.com/eduard-mazo/iec104sniffer.git](https://github.com/eduard-mazo/iec104sniffer.git)
-    cd iec104sniffer
+    git clone https://github.com/eduard-mazo/goSniffer.git
+    cd goSniffer
     ```
 
 2.  **Build the application:**
