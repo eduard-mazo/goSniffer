@@ -24,10 +24,14 @@ const (
 	StartByte = 0x68 // Exportado para uso en otros paquetes
 
 	// Tipos de ASDU (Type Identification)
-	TypeIDMvf         = 13 // Measured value, normalized value
-	TypeIDMvfWithTime = 36 // Measured value, short float with time tag
-	TypeIDSiq         = 30 // Single-point information with time tag
-	TypeIDDiq         = 31 // Double-point information with time tag
+	TypeIDSpNa        = 1  // M_SP_NA_1 - Single-point information
+	TypeIDMvf         = 13 // M_ME_NC_1 - Measured value, short floating point number
+	TypeIDMvfWithTime = 36 // M_ME_TF_1 - Measured value, short floating point number with time tag CP56Time2a
+	TypeIDSiq         = 30 // M_SP_TB_1 - Single-point information with time tag CP56Time2a
+	TypeIDDiq         = 31 // M_DP_TB_1 - Double-point information with time tag CP56Time2a
+	TypeIDStTb        = 32 // M_ST_TB_1 - Step position information with time tag CP56Time2a
+	TypeIDSingleCmd   = 45 // C_SC_NA_1 - Single command
+	TypeIDDoubleCmd   = 46 // C_DC_NA_1 - Double command
 )
 
 // TypeInfo y typeInfoMap para la descripción detallada de las tramas.
@@ -37,16 +41,25 @@ type TypeInfo struct {
 }
 
 var typeInfoMap = map[byte]TypeInfo{
-	TypeIDMvf:         {"M_ME_NA_1", "Measured value, normalized value"},
-	TypeIDMvfWithTime: {"M_ME_TF_1", "Measured value, short float with time"},
-	TypeIDSiq:         {"M_SP_TB_1", "Single-point information with time tag"},
-	TypeIDDiq:         {"M_DP_TB_1", "Double-point information with time tag"},
-	250:               {"U-FRAME TESTFR (Activation)", "Test Frame Activation"},
-	251:               {"U-FRAME TESTFR (Confirm)", "Test Frame Confirmation"},
-	252:               {"U-FRAME STARTDT (Activation)", "Start Data Transfer Activation"},
-	253:               {"U-FRAME STARTDT (Confirm)", "Start Data Transfer Confirmation"},
-	254:               {"U-FRAME STOPDT (Activation)", "Stop Data Transfer Activation"},
-	255:               {"U-FRAME STOPDT (Confirm)", "Stop Data Transfer Confirmation"},
+	// Medidos / Eventos
+	TypeIDSpNa:        {"M_SP_NA_1", "Single-point information"},
+	TypeIDMvf:         {"M_ME_NC_1", "Measured value, short floating point number"},
+	TypeIDMvfWithTime: {"M_ME_TF_1", "Measured value, short floating point number with time tag CP56Time2a"},
+	TypeIDSiq:         {"M_SP_TB_1", "Single-point information with time tag CP56Time2a"},
+	TypeIDDiq:         {"M_DP_TB_1", "Double-point information with time tag CP56Time2a"},
+	TypeIDStTb:        {"M_ST_TB_1", "Step position information with time tag CP56Time2a"},
+
+	// Comandos
+	TypeIDSingleCmd: {"C_SC_NA_1", "Single command"},
+	TypeIDDoubleCmd: {"C_DC_NA_1", "Double command"},
+
+	// U-Frames (informativos)
+	250: {"U-FRAME TESTFR (Activation)", "Test Frame Activation"},
+	251: {"U-FRAME TESTFR (Confirm)", "Test Frame Confirmation"},
+	252: {"U-FRAME STARTDT (Activation)", "Start Data Transfer Activation"},
+	253: {"U-FRAME STARTDT (Confirm)", "Start Data Transfer Confirmation"},
+	254: {"U-FRAME STOPDT (Activation)", "Stop Data Transfer Activation"},
+	255: {"U-FRAME STOPDT (Confirm)", "Stop Data Transfer Confirmation"},
 }
 
 // Mapa con descripciones para la Causa de la Transmisión (COT).
@@ -71,9 +84,7 @@ func ProcessPacketWorker(ch <-chan PacketToProcess) {
 		if p.SourceIP == p.LocalIP {
 			direction = "Tx"
 		}
-
 		output := parseAPDU(p.Payload, p.TypeFilter, p.PointFilter, direction, p.SourceIP, p.DestinationIP)
-
 		if output != "" {
 			timestamp := time.Now().Format("15:04:05.000")
 			if p.RawOutput {
@@ -112,18 +123,20 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 	if len(data) < 12 {
 		return ""
 	}
-
 	sendSeqNum := int(binary.LittleEndian.Uint16(data[2:4]) >> 1)
 	recvSeqNum := int(binary.LittleEndian.Uint16(data[4:6]) >> 1)
-
 	asdu := data[6:]
 	if len(asdu) < 6 {
 		return ""
 	}
+
 	typeID := asdu[0]
 
+	// Nota: este filtro "rango 13..36" permite que pasen tipos medidos comunes; si se usa "control",
+	// siempre deja pasar. (Se mantiene la lógica original.)
 	if !applyFilter("control", 0, typeFilter, nil) && (typeID < TypeIDMvf || typeID > TypeIDMvfWithTime) {
 		if typeFilter == "control" {
+			// no-op
 		} else {
 			return ""
 		}
@@ -141,7 +154,7 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 		cotDesc = "Unknown"
 	}
 
-	header := fmt.Sprintf("%s | I-FRAME (%s | ID [%d] | %s) | N(S)=%d N(R)=%d\tCause: %d (%s) | Common Addr: %d\n",
+	header := fmt.Sprintf("%s \n I-FRAME (%s \n ID [%d] \n %s) \n N(S)=%d N(R)=%d\tCause: %d (%s) \n Common Addr: %d\n",
 		flowInfo, info.Name, typeID, info.Description, sendSeqNum, recvSeqNum, cot, cotDesc, casdu)
 
 	var asduOutput strings.Builder
@@ -177,6 +190,20 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 		var pointOutput string
 
 		switch typeID {
+		// --- Nuevos: Single point sin tiempo ---
+		case TypeIDSpNa:
+			const dataSize = 1 // SIQ (1)
+			if len(asdu) < cursor+dataSize {
+				break
+			}
+			if applyFilter("digital", int(addr), typeFilter, pointFilter) {
+				siq := asdu[cursor]
+				spi := siq & 0x01
+				pointOutput = fmt.Sprintf("\tSINGLE\tAddr: %-6d\tVal: %d\tSIQ: 0x%02X\n", addr, spi, siq)
+			}
+			cursor += dataSize
+
+		// --- Medidos: float corto (M_ME_NC_1) ---
 		case TypeIDMvf:
 			const dataSize = 5 // Value(4) + QDS(1)
 			if len(asdu) < cursor+dataSize {
@@ -185,9 +212,9 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 			if applyFilter("analog", int(addr), typeFilter, pointFilter) {
 				value := math.Float32frombits(binary.LittleEndian.Uint32(asdu[cursor : cursor+4]))
 				qds := asdu[cursor+4]
-				pointOutput = fmt.Sprintf("\tANALOG\tAddr: %-6d\t| Val: %-10.6f\t| QDS: 0x%02X\n", addr, value, qds)
+				pointOutput = fmt.Sprintf("\tANALOG\tAddr: %-6d\tVal: %-10.6f\tQDS: 0x%02X\n", addr, value, qds)
 			}
-			cursor += dataSize // Avanza el cursor por el tamaño de los datos
+			cursor += dataSize
 
 		case TypeIDMvfWithTime:
 			const dataSize = 12 // Value(4) + QDS(1) + Timestamp(7)
@@ -200,22 +227,22 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 				qds := asdu[cursor+4]
 				ts := parseCP56(asdu[cursor+5 : cursor+12])
 				pointOutput = fmt.Sprintf(
-					"\tANALOG_T\tAddr: %-6d\t| Val: %-10.6f\t| QDS: 0x%02X\t| Time: %s\n",
+					"\tANALOG_T\tAddr: %-6d\tVal: %-10.6f\tQDS: 0x%02X\tTime: %s\n",
 					addr, value, qds, ts.Format("15:04:05.000"))
 			}
 			cursor += dataSize
 
 		case TypeIDSiq:
-			const dataSize = 8 // SPI(1) + Timestamp(7)
+			const dataSize = 8 // SIQ(1) + Timestamp(7)
 			if len(asdu) < cursor+dataSize {
 				break
 			}
 			if applyFilter("digital", int(addr), typeFilter, pointFilter) {
 				spi := asdu[cursor] & 0x01
 				ts := parseCP56(asdu[cursor+1 : cursor+8])
-				pointOutput = fmt.Sprintf("\tSINGLE\tAddr: %-6d\t| Val: %d\t| Time: %s\n", addr, spi, ts.Format("15:04:05.000"))
+				pointOutput = fmt.Sprintf("\tSINGLE\tAddr: %-6d\tVal: %d\tTime: %s\n", addr, spi, ts.Format("15:04:05.000"))
 			}
-			cursor += dataSize // Avanza el cursor por el tamaño de los datos
+			cursor += dataSize
 
 		case TypeIDDiq:
 			const dataSize = 8 // DPI(1) + Timestamp(7)
@@ -225,12 +252,61 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 			if applyFilter("double", int(addr), typeFilter, pointFilter) {
 				dpi := asdu[cursor] & 0x03
 				ts := parseCP56(asdu[cursor+1 : cursor+8])
-				pointOutput = fmt.Sprintf("\tDOUBLE\tAddr: %-6d\t| Val: %d\t| Time: %s\n", addr, dpi, ts.Format("15:04:05.000"))
+				pointOutput = fmt.Sprintf("\tDOUBLE\tAddr: %-6d\tVal: %d\tTime: %s\n", addr, dpi, ts.Format("15:04:05.000"))
 			}
-			cursor += dataSize // Avanza el cursor por el tamaño de los datos
+			cursor += dataSize
+
+		// --- Nuevo: Step position con tiempo (M_ST_TB_1) ---
+		case TypeIDStTb:
+			const dataSize = 9 // VTI(1) + QDS(1) + Timestamp(7)
+			if len(asdu) < cursor+dataSize {
+				break
+			}
+			if applyFilter("analog", int(addr), typeFilter, pointFilter) {
+				vti := asdu[cursor]
+				raw := int(vti & 0x7F) // 7 bits (signed -64..+63)
+				if raw >= 64 {
+					raw = raw - 128
+				}
+				transient := (vti & 0x80) != 0
+				qds := asdu[cursor+1]
+				ts := parseCP56(asdu[cursor+2 : cursor+9])
+				pointOutput = fmt.Sprintf("\tSTEP_T\tAddr: %-6d\tVTI: %d\tT:%t\tQDS: 0x%02X\tTime: %s\n",
+					addr, raw, transient, qds, ts.Format("15:04:05.000"))
+			}
+			cursor += dataSize
+
+		// --- Nuevos: Comandos (sin tiempo) ---
+		case TypeIDSingleCmd:
+			const dataSize = 1 // SCO (1)
+			if len(asdu) < cursor+dataSize {
+				break
+			}
+			if applyFilter("control", int(addr), typeFilter, pointFilter) {
+				sco := asdu[cursor]
+				se := (sco & 0x80) != 0
+				qu := int((sco >> 2) & 0x1F)
+				scs := int(sco & 0x01)
+				pointOutput = fmt.Sprintf("\tCMD_SC\tAddr: %-6d\tS/E:%t\tSCS:%d\tQU:%d\n", addr, se, scs, qu)
+			}
+			cursor += dataSize
+
+		case TypeIDDoubleCmd:
+			const dataSize = 1 // DCO (1)
+			if len(asdu) < cursor+dataSize {
+				break
+			}
+			if applyFilter("control", int(addr), typeFilter, pointFilter) {
+				dco := asdu[cursor]
+				se := (dco & 0x80) != 0
+				qu := int((dco >> 2) & 0x1F)
+				dcs := int(dco & 0x03)
+				pointOutput = fmt.Sprintf("\tCMD_DC\tAddr: %-6d\tS/E:%t\tDCS:%d\tQU:%d\n", addr, se, dcs, qu)
+			}
+			cursor += dataSize
 
 		default:
-			i = numObjects // Si el tipo es desconocido, salimos del bucle
+			i = numObjects // Tipo desconocido: salimos del bucle
 		}
 
 		if pointOutput != "" {
@@ -241,7 +317,6 @@ func parseIFrame(data []byte, typeFilter string, pointFilter map[int]struct{}, f
 	if asduOutput.Len() > 0 {
 		return header + asduOutput.String()
 	}
-
 	return ""
 }
 
@@ -250,7 +325,7 @@ func parseSFrame(control3, control4 byte, typeFilter, flowInfo string) string {
 		return ""
 	}
 	recvSeqNum := int(binary.LittleEndian.Uint16([]byte{control3, control4}) >> 1)
-	return fmt.Sprintf("%s | S-FRAME (Supervisory-frame) | ACK, N(R)=%d\n", flowInfo, recvSeqNum)
+	return fmt.Sprintf("%s \n S-FRAME (Supervisory-frame) \n ACK, N(R)=%d\n", flowInfo, recvSeqNum)
 }
 
 func parseUFrame(control1 byte, typeFilter, flowInfo string) string {
@@ -272,10 +347,10 @@ func parseUFrame(control1 byte, typeFilter, flowInfo string) string {
 	case (control1 & 0b00100000) != 0:
 		uTypeID = 255
 	default:
-		return fmt.Sprintf("%s | U-FRAME (Unknown)\n", flowInfo)
+		return fmt.Sprintf("%s \n U-FRAME (Unknown)\n", flowInfo)
 	}
 	info := typeInfoMap[uTypeID]
-	return fmt.Sprintf("%s | %s | ID [%d]\n", flowInfo, info.Name, uTypeID)
+	return fmt.Sprintf("%s \n %s \n ID [%d]\n", flowInfo, info.Name, uTypeID)
 }
 
 func applyFilter(dataType string, addr int, typeFilter string, pointFilter map[int]struct{}) bool {
@@ -292,12 +367,10 @@ func applyFilter(dataType string, addr int, typeFilter string, pointFilter map[i
 			return false
 		}
 	}
-
 	if len(pointFilter) > 0 {
 		_, ok := pointFilter[addr]
 		return ok
 	}
-
 	return true
 }
 
@@ -311,7 +384,6 @@ func parseCP56(buf []byte) time.Time {
 	day := int(buf[4] & 0x1F)
 	month := int(buf[5] & 0x0F)
 	year := 2000 + int(buf[6]&0x7F)
-
 	return time.Date(year, time.Month(month), day, hour, min, ms/1000, (ms%1000)*1e6, time.UTC)
 }
 
@@ -329,7 +401,7 @@ func hexDump(data []byte) string {
 		for j := 0; j < len(hexPart); j += 2 {
 			spacedHex += hexPart[j:j+2] + " "
 		}
-		sb.WriteString(fmt.Sprintf("  %04X: %-48s\n", i, spacedHex))
+		sb.WriteString(fmt.Sprintf(" %04X: %-48s\n", i, spacedHex))
 	}
 	return sb.String()
 }
