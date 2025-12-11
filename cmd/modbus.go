@@ -14,9 +14,10 @@ import (
 )
 
 var (
-	modbusIp    string
-	modbusPorts string
-	modbusRaw   bool
+	modbusIp     string
+	modbusPorts  string
+	modbusTarget string
+	modbusRaw    bool
 )
 
 var modbusCmd = &cobra.Command{
@@ -57,17 +58,22 @@ var modbusCmd = &cobra.Command{
 				continue
 			}
 			wgListeners.Add(1)
-			go listenModbus(iface, modbusIp, p, modbusRaw, packetChan, &wgListeners)
+			go listenModbus(iface, modbusIp, p, modbusTarget, modbusRaw, packetChan, &wgListeners)
 		}
 
-		fmt.Printf("🚀 Escuchando Modbus en puertos: %s\n", modbusPorts)
+		fmt.Printf("🚀 Escuchando Modbus en puertos: %s", modbusPorts)
+		if modbusTarget != "" {
+			fmt.Printf(" | Filtrando comunicación con: %s", modbusTarget)
+		}
+		fmt.Println("\nPresione Ctrl+C para detener.")
+
 		wgListeners.Wait()
 		close(packetChan)
 		wgWorkers.Wait()
 	},
 }
 
-func listenModbus(iface, localIP, port string, raw bool, ch chan<- modbus.PacketToProcess, wg *sync.WaitGroup) {
+func listenModbus(iface, localIP, port, targetIP string, raw bool, ch chan<- modbus.PacketToProcess, wg *sync.WaitGroup) {
 	defer wg.Done()
 	handle, err := pcap.OpenLive(iface, 1600, true, pcap.BlockForever)
 	if err != nil {
@@ -76,8 +82,13 @@ func listenModbus(iface, localIP, port string, raw bool, ch chan<- modbus.Packet
 	}
 	defer handle.Close()
 
-	if err := handle.SetBPFFilter("tcp port " + port); err != nil {
-		log.Printf("Error BPF puerto %s: %v", port, err)
+	bpfFilter := fmt.Sprintf("tcp port %s", port)
+	if targetIP != "" {
+		bpfFilter = fmt.Sprintf("tcp port %s and host %s", port, targetIP)
+	}
+
+	if err := handle.SetBPFFilter(bpfFilter); err != nil {
+		log.Printf("Error aplicando filtro BPF '%s': %v", bpfFilter, err)
 		return
 	}
 
@@ -110,8 +121,10 @@ func init() {
 	sniffCmd.AddCommand(modbusCmd)
 	modbusCmd.Flags().StringVar(&modbusIp, "ip", "", "IP de la interfaz local")
 	modbusCmd.Flags().StringVar(&modbusPorts, "port", "502", "Puertos TCP separados por coma")
+	modbusCmd.Flags().StringVar(&modbusTarget, "target", "", "IP del equipo remoto para filtrar tráfico específico")
 	modbusCmd.Flags().BoolVar(&modbusRaw, "raw", false, "Ver Hexadecimal crudo")
-		if err := modbusCmd.MarkFlagRequired("ip"); err != nil {
+
+	if err := modbusCmd.MarkFlagRequired("ip"); err != nil {
 		log.Fatalf("Failed to mark 'ip' flag as required: %v", err)
 	}
 }
