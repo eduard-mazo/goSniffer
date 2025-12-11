@@ -8,8 +8,8 @@ import (
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "104scan",
-	Short: "Sniffer IEC 60870-5-104 CLI",
+	Use:   "Sniffer",
+	Short: "Sniffer IEC 60870-5-104 & Modbus CLI",
 }
 
 func Execute() {
@@ -20,6 +20,5 @@ func Execute() {
 }
 
 func init() {
-	rootCmd.AddCommand(sniffCmd)
 	rootCmd.AddCommand(listCmd)
 }
