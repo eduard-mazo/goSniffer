@@ -11,12 +11,14 @@ import (
 )
 
 type PacketToProcess struct {
-	Payload       []byte
-	LocalIP       string
-	SourceIP      string
-	DestinationIP string
-	RawOutput     bool
-	TCPInfo       string
+	Payload         []byte
+	LocalIP         string
+	SourceIP        string
+	SourcePort      string
+	DestinationIP   string
+	DestinationPort string
+	RawOutput       bool
+	TCPInfo         string
 }
 
 const (
@@ -54,79 +56,103 @@ var requestCache sync.Map
 
 func ProcessPacketWorker(ch <-chan PacketToProcess) {
 	for p := range ch {
-		direction := "Rx"
+		// Determinar Dirección
+		direction := "RX"
 		if p.SourceIP == p.LocalIP {
-			direction = "Tx"
+			direction = "TX"
 		}
 
-		timestamp := time.Now().Format("15:04:05.000")
+		timestamp := time.Now().Format("2006-01-02 15:04:05.000")
 
-		// 1. Mostrar Eventos de Control TCP (Conexión, Reset, ACK vacío)
+		// Construcción del Buffer de Salida
+		var sb strings.Builder
+		sb.WriteString("------------------------------------------------------------\n")
+		sb.WriteString(fmt.Sprintf("Timestamp:    %s\n", timestamp))
+		sb.WriteString(fmt.Sprintf("Direction:    %s\n", direction))
+
+		protocol := "ModbusTCP"
+		if len(p.Payload) == 0 && p.TCPInfo != "" {
+			protocol = "TCP" // Solo control TCP
+		}
+		sb.WriteString(fmt.Sprintf("Protocol:     %s\n", protocol))
+		sb.WriteString(fmt.Sprintf("Source:       %s:%s\n", p.SourceIP, p.SourcePort))
+		sb.WriteString(fmt.Sprintf("Destination:  %s:%s\n", p.DestinationIP, p.DestinationPort))
+
 		if p.TCPInfo != "" {
-			icon := "🔔"
-			msg := "Connection Event"
+			// Si hay eventos TCP, los mostramos en la cabecera
+			sb.WriteString(fmt.Sprintf("TCP Flags:    %s\n", p.TCPInfo))
+		}
+		sb.WriteString("------------------------------------------------------------\n")
 
-			if strings.Contains(p.TCPInfo, "RST") {
-				icon = "🔥"
-				msg = "RESET"
-			} else if strings.Contains(p.TCPInfo, "FIN") {
-				icon = "🚫"
-				msg = "CLOSE"
-			} else if strings.Contains(p.TCPInfo, "SYN") {
-				icon = "✨"
-				msg = "NEW CONNECTION"
-			} else if strings.Contains(p.TCPInfo, "ACK") {
-				icon = "✅"
-				msg = "RECEIPT CONFIRMED (No Data)"
+		// Si es un paquete Modbus (tiene payload suficiente)
+		if len(p.Payload) >= 7 {
+			mbap, pduBytes, err := parseMBAP(p.Payload, &sb)
+			if err == nil {
+				parsePDU(mbap, pduBytes, &sb)
 			}
 
-			fmt.Printf("\n%s\n[%s] %s -> %s\n %s TCP: [%s] %s\n",
-				timestamp, direction, p.SourceIP, p.DestinationIP, icon, p.TCPInfo, msg)
-
-			// Si es solo un paquete de control sin datos Modbus, continuamos
-			if len(p.Payload) == 0 {
-				continue
-			}
+			// Sección RAW al final
+			sb.WriteString("------------------------------------------------------------\n")
+			sb.WriteString("RAW:\n")
+			sb.WriteString(hexDumpFlat(p.Payload))
+			sb.WriteString("\n------------------------------------------------------------\n")
+			sb.WriteString("============================================================\n")
+		} else if p.TCPInfo != "" {
+			// Si es solo TCP event (ACK, RST), cerramos la caja visualmente
+			sb.WriteString("(No Data Payload)\n")
+			sb.WriteString("------------------------------------------------------------\n")
+			sb.WriteString("============================================================\n")
 		}
 
-		// 2. Procesamiento Modbus (Requiere al menos 7 bytes de cabecera MBAP)
-		if len(p.Payload) < 7 {
-			continue
-		}
-
-		output := parseMBAP(p.Payload, direction, p.SourceIP, p.DestinationIP)
-
-		if output != "" {
-			// Formato solicitado: Timestamp -> Raw Packet (si aplica) -> Decodificación
-			if p.RawOutput {
-				fmt.Printf("\n%s\n%s", timestamp, hexDump(p.Payload))
-			} else if p.TCPInfo == "" {
-				// Si no imprimimos evento TCP antes, imprimimos el timestamp aquí
-				fmt.Printf("\n%s\n", timestamp)
-			}
-			fmt.Print(output)
-		}
+		fmt.Print(sb.String())
 	}
 }
 
-func parseMBAP(data []byte, direction, srcIP, dstIP string) string {
-	transID := binary.BigEndian.Uint16(data[0:2])
-	protoID := binary.BigEndian.Uint16(data[2:4])
-	length := binary.BigEndian.Uint16(data[4:6])
-	unitID := data[6]
+// Estructura interna para pasar datos del MBAP
+type mbapHeader struct {
+	TransID  uint16
+	ProtoID  uint16
+	Length   uint16
+	UnitID   byte
+	FuncCode byte
+}
 
-	if protoID != 0 {
-		return ""
+func parseMBAP(data []byte, sb *strings.Builder) (mbapHeader, []byte, error) {
+	if len(data) < 7 {
+		return mbapHeader{}, nil, fmt.Errorf("short packet")
+	}
+
+	h := mbapHeader{
+		TransID: binary.BigEndian.Uint16(data[0:2]),
+		ProtoID: binary.BigEndian.Uint16(data[2:4]),
+		Length:  binary.BigEndian.Uint16(data[4:6]),
+		UnitID:  data[6],
+	}
+
+	// Protocol ID 0 = Modbus TCP
+	if h.ProtoID != 0 {
+		return h, nil, fmt.Errorf("invalid proto id")
 	}
 
 	pdu := data[7:]
 	if len(pdu) == 0 {
-		return ""
+		return h, nil, fmt.Errorf("empty pdu")
 	}
+	h.FuncCode = pdu[0]
 
-	funcCode := pdu[0]
-	funcName := "Unknown"
+	sb.WriteString("MBAP Header\n")
+	sb.WriteString(fmt.Sprintf("   Transaction ID: 0x%04X\n", h.TransID))
+	sb.WriteString(fmt.Sprintf("   Protocol ID:    0x%04X\n", h.ProtoID))
+	sb.WriteString(fmt.Sprintf("   Length:         %d\n", h.Length))
+	sb.WriteString(fmt.Sprintf("   Unit ID:        %d\n", h.UnitID))
+
+	return h, pdu, nil
+}
+
+func parsePDU(h mbapHeader, data []byte, sb *strings.Builder) {
+	funcCode := h.FuncCode
 	isError := false
+	funcName := "Unknown"
 
 	if funcCode > 0x80 {
 		isError = true
@@ -142,112 +168,99 @@ func parseMBAP(data []byte, direction, srcIP, dstIP string) string {
 		}
 	}
 
-	header := fmt.Sprintf("[%s] %s -> %s \n MBAP: TransID: %04X | Unit: %d | Len: %d \n Function: %d (%s)\n",
-		direction, srcIP, dstIP, transID, unitID, length, funcCode, funcName)
+	sb.WriteString("PDU\n")
+	sb.WriteString(fmt.Sprintf("   Function:             %02d – %s\n", funcCode, funcName))
 
-	details := parsePDU(transID, funcCode, pdu, isError)
-	return header + details
-}
-
-func parsePDU(transID uint16, funcCode byte, data []byte, isError bool) string {
 	if isError {
 		if len(data) >= 2 {
 			exCode := data[1]
-			exDesc, ok := exceptionMap[exCode]
-			if !ok {
+			exDesc := exceptionMap[exCode]
+			if exDesc == "" {
 				exDesc = "Unknown"
 			}
-			return fmt.Sprintf("  ❌ Exception Code: %02X (%s)\n", exCode, exDesc)
+			sb.WriteString(fmt.Sprintf("   Exception Code:       0x%02X (%s)\n", exCode, exDesc))
 		}
-		return "  ❌ Malformed Error PDU\n"
+		return
 	}
 
 	if len(data) < 2 {
-		return ""
+		return
 	}
-	payload := data[1:] // Payload sin Function Code
-	var sb strings.Builder
+	payload := data[1:]
 
 	switch funcCode {
 	// --- LECTURAS (01, 02, 03, 04) ---
 	case FuncReadCoils, FuncReadInputStatus, FuncReadHoldingRegisters, FuncReadInputRegisters:
-		// REQUEST: Siempre 4 bytes (Addr + Qty)
+		// REQUEST
 		if len(payload) == 4 {
 			addr := binary.BigEndian.Uint16(payload[0:2])
 			qty := binary.BigEndian.Uint16(payload[2:4])
 
-			requestCache.Store(transID, addr)
+			requestCache.Store(h.TransID, addr)
 
-			sb.WriteString(fmt.Sprintf("  Request -> Start Addr: %d, Quantity: %d\n", addr, qty))
+			sb.WriteString(fmt.Sprintf("   Data Address:         %d (0x%04X)\n", addr, addr))
+			sb.WriteString(fmt.Sprintf("   Register Count:       %d\n", qty))
 
 		} else if len(payload) > 1 {
 			// RESPONSE
 			byteCount := int(payload[0])
 			dataBytes := payload[1:]
-			sb.WriteString(fmt.Sprintf("  Response -> Bytes: %d\n", byteCount))
+			sb.WriteString(fmt.Sprintf("   Byte Count:           %d\n", byteCount))
 
 			var startAddr uint16 = 0
 			var hasAddr = false
-			if val, ok := requestCache.Load(transID); ok {
+			if val, ok := requestCache.Load(h.TransID); ok {
 				startAddr = val.(uint16)
 				hasAddr = true
+				// requestCache.Delete(h.TransID)
 			}
 
-			// REGISTROS (03, 04)
+			// Decodificación de Registros (Float/Int)
 			if funcCode == FuncReadHoldingRegisters || funcCode == FuncReadInputRegisters {
-				sb.WriteString("    Raw Integers:\n")
-				count := 0
+				sb.WriteString("   Data (Registers):\n")
+				// Raw Integers
 				for i := 0; i < len(dataBytes)-1; i += 2 {
-					// Limitar vista raw si es muy larga
-					if count >= 8 {
-						sb.WriteString("      ... (Raw recortada por longitud) ...\n")
+					if i >= 16 { // Limitar vista si es muy largo
+						sb.WriteString("      ... (more raw data hidden) ...\n")
 						break
 					}
 					val := binary.BigEndian.Uint16(dataBytes[i : i+2])
-
-					label := fmt.Sprintf("Reg[%d]", count)
+					label := fmt.Sprintf("[%d]", i/2)
 					if hasAddr {
-						label = fmt.Sprintf("Reg[%d]", startAddr+uint16(count))
+						label = fmt.Sprintf("[%d]", startAddr+uint16(i/2))
 					}
-					sb.WriteString(fmt.Sprintf("      %s: %d (0x%04X)\n", label, val, val))
-					count++
+					sb.WriteString(fmt.Sprintf("      Reg%s: %d (0x%04X)\n", label, val, val))
 				}
 
-				// Interpretación Float32 (CDAB / Word Swap)
+				// Interpretation Float
 				if len(dataBytes) >= 4 {
-					sb.WriteString("    Interpretation (Float32 Little-Endian/Word-Swap):\n")
+					sb.WriteString("   Interpretation (Float32 Little-Endian/Word-Swap):\n")
 					regIdx := 0
 					for i := 0; i <= len(dataBytes)-4; i += 4 {
 						b0, b1, b2, b3 := dataBytes[i], dataBytes[i+1], dataBytes[i+2], dataBytes[i+3]
-						// Reconstrucción CDAB
 						bits := (uint32(b2) << 24) | (uint32(b3) << 16) | (uint32(b0) << 8) | uint32(b1)
 						floatVal := math.Float32frombits(bits)
 
-						label := fmt.Sprintf("Regs[%d-%d]", regIdx, regIdx+1)
+						label := fmt.Sprintf("[%d-%d]", regIdx, regIdx+1)
 						if hasAddr {
-							base := startAddr + uint16(regIdx)
-							label = fmt.Sprintf("Addr[%d]", base)
+							label = fmt.Sprintf("[%d]", startAddr+uint16(regIdx))
 						}
-						sb.WriteString(fmt.Sprintf("      %s: %10.6f\n", label, floatVal))
+						sb.WriteString(fmt.Sprintf("      Addr%s: %.6f\n", label, floatVal))
 						regIdx += 2
 					}
 				}
-
 			} else {
-				// BITS (01, 02)
-				sb.WriteString(fmt.Sprintf("    Raw Hex: %X\n", dataBytes))
-				sb.WriteString("    Bit Interpretation:\n")
-
+				// Decodificación de Bits
+				sb.WriteString("   Data (Bits):\n")
 				bitCount := 0
 				for _, b := range dataBytes {
 					for bitIdx := 0; bitIdx < 8; bitIdx++ {
 						val := (b >> bitIdx) & 0x01
-
-						label := fmt.Sprintf("[+%02d]", bitCount)
+						label := fmt.Sprintf("+%02d", bitCount)
 						if hasAddr {
-							label = fmt.Sprintf("[%d]", startAddr+uint16(bitCount))
+							label = fmt.Sprintf("%d", startAddr+uint16(bitCount))
 						}
-						sb.WriteString(fmt.Sprintf("      %s: %d\n", label, val))
+						sb.WriteString(fmt.Sprintf("      Bit [%s]: %d\n", label, val))
 						bitCount++
 					}
 				}
@@ -259,38 +272,32 @@ func parsePDU(transID uint16, funcCode byte, data []byte, isError bool) string {
 		if len(payload) == 4 {
 			addr := binary.BigEndian.Uint16(payload[0:2])
 			val := binary.BigEndian.Uint16(payload[2:4])
-			sb.WriteString(fmt.Sprintf("  Write -> Addr: %d, Value: %d (0x%04X)\n", addr, val, val))
+			sb.WriteString(fmt.Sprintf("   Write Address:        %d (0x%04X)\n", addr, addr))
+			sb.WriteString(fmt.Sprintf("   Write Value:          %d (0x%04X)\n", val, val))
 		}
 	case FuncWriteMultipleCoils, FuncWriteMultipleRegs:
-		if len(payload) >= 5 {
+		if len(payload) >= 5 { // Request
 			addr := binary.BigEndian.Uint16(payload[0:2])
 			qty := binary.BigEndian.Uint16(payload[2:4])
 			bytes := payload[4]
-			sb.WriteString(fmt.Sprintf("  Write Multiple -> Addr: %d, Qty: %d, Bytes: %d\n", addr, qty, bytes))
-		} else if len(payload) == 4 {
+			sb.WriteString(fmt.Sprintf("   Write Address:        %d (0x%04X)\n", addr, addr))
+			sb.WriteString(fmt.Sprintf("   Quantity:             %d\n", qty))
+			sb.WriteString(fmt.Sprintf("   Byte Count:           %d\n", bytes))
+		} else if len(payload) == 4 { // Response
 			addr := binary.BigEndian.Uint16(payload[0:2])
 			qty := binary.BigEndian.Uint16(payload[2:4])
-			sb.WriteString(fmt.Sprintf("  Response -> Addr: %d, Qty: %d\n", addr, qty))
+			sb.WriteString(fmt.Sprintf("   Write Address:        %d (0x%04X)\n", addr, addr))
+			sb.WriteString(fmt.Sprintf("   Quantity:             %d\n", qty))
 		}
 	}
-	return sb.String()
 }
 
-func hexDump(data []byte) string {
+func hexDumpFlat(data []byte) string {
+	hexStr := strings.ToUpper(hex.EncodeToString(data))
 	var sb strings.Builder
-	sb.WriteString("--- RAW PACKET ---\n")
-	for i := 0; i < len(data); i += 16 {
-		end := i + 16
-		if end > len(data) {
-			end = len(data)
-		}
-		line := data[i:end]
-		hexPart := strings.ToUpper(hex.EncodeToString(line))
-		spaced := ""
-		for j := 0; j < len(hexPart); j += 2 {
-			spaced += hexPart[j:j+2] + " "
-		}
-		sb.WriteString(fmt.Sprintf(" %04X: %s\n", i, spaced))
+	for i := 0; i < len(hexStr); i += 2 {
+		sb.WriteString(hexStr[i : i+2])
+		sb.WriteString(" ")
 	}
 	return sb.String()
 }

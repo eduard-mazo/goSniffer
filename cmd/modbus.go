@@ -82,7 +82,6 @@ func listenModbus(iface, localIP, port, targetIP string, raw bool, ch chan<- mod
 	}
 	defer handle.Close()
 
-	// Filtro BPF
 	bpfFilter := fmt.Sprintf("tcp port %s", port)
 	if targetIP != "" {
 		bpfFilter = fmt.Sprintf("tcp port %s and host %s", port, targetIP)
@@ -102,15 +101,17 @@ func listenModbus(iface, localIP, port, targetIP string, raw bool, ch chan<- mod
 			ip, _ := ipLayer.(*layers.IPv4)
 			tcp, _ := tcpLayer.(*layers.TCP)
 
-			// 1. Detección de Flags TCP (Control)
 			var tcpFlags []string
-			if tcp.SYN { tcpFlags = append(tcpFlags, "SYN") }
-			if tcp.FIN { tcpFlags = append(tcpFlags, "FIN") }
-			if tcp.RST { tcpFlags = append(tcpFlags, "RST") }
-			
-			// Detectar ACK puro solo si no es parte de otro flag de control
+			if tcp.SYN {
+				tcpFlags = append(tcpFlags, "SYN")
+			}
+			if tcp.FIN {
+				tcpFlags = append(tcpFlags, "FIN")
+			}
+			if tcp.RST {
+				tcpFlags = append(tcpFlags, "RST")
+			}
 			if tcp.ACK && !tcp.SYN && !tcp.FIN && !tcp.RST {
-				// Solo nos interesa si el payload está vacío (ACK puro de confirmación)
 				if len(tcp.Payload) == 0 {
 					tcpFlags = append(tcpFlags, "ACK")
 				}
@@ -118,10 +119,7 @@ func listenModbus(iface, localIP, port, targetIP string, raw bool, ch chan<- mod
 
 			tcpInfo := strings.Join(tcpFlags, ", ")
 
-			// 2. Filtrado Lógico
 			hasPayload := len(tcp.Payload) > 0
-			// Si tenemos un targetIP definido, nos interesan los ACKs para diagnosticar bloqueos.
-			// Si no hay target, los ACKs puros son mucho ruido, así que los ignoramos.
 			isInterestingControl := len(tcpFlags) > 0
 			if tcpInfo == "ACK" && targetIP == "" {
 				isInterestingControl = false
@@ -132,12 +130,14 @@ func listenModbus(iface, localIP, port, targetIP string, raw bool, ch chan<- mod
 				copy(payloadCopy, tcp.Payload)
 
 				ch <- modbus.PacketToProcess{
-					Payload:       payloadCopy,
-					LocalIP:       localIP,
-					SourceIP:      ip.SrcIP.String(),
-					DestinationIP: ip.DstIP.String(),
-					RawOutput:     raw,
-					TCPInfo:       tcpInfo,
+					Payload:         payloadCopy,
+					LocalIP:         localIP,
+					SourceIP:        ip.SrcIP.String(),
+					SourcePort:      tcp.SrcPort.String(),
+					DestinationIP:   ip.DstIP.String(),
+					DestinationPort: tcp.DstPort.String(),
+					RawOutput:       raw,
+					TCPInfo:         tcpInfo,
 				}
 			}
 		}
@@ -145,14 +145,12 @@ func listenModbus(iface, localIP, port, targetIP string, raw bool, ch chan<- mod
 }
 
 func init() {
-	// Asegúrate de que sniffCmd esté definido en sniff.go
 	sniffCmd.AddCommand(modbusCmd)
-	
 	modbusCmd.Flags().StringVar(&modbusIp, "ip", "", "IP de la interfaz local")
 	modbusCmd.Flags().StringVar(&modbusPorts, "port", "502", "Puertos TCP separados por coma")
 	modbusCmd.Flags().StringVar(&modbusTarget, "target", "", "IP del equipo remoto para filtrar tráfico específico")
 	modbusCmd.Flags().BoolVar(&modbusRaw, "raw", false, "Ver Hexadecimal crudo")
-	
+
 	if err := modbusCmd.MarkFlagRequired("ip"); err != nil {
 		log.Fatalf("Failed to mark 'ip' flag as required: %v", err)
 	}
